@@ -1,10 +1,10 @@
+import hashlib
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional, Tuple
 
 import h5py
 import nibabel as nib
 import numpy as np
-import hashlib
 
 
 class RoiPack:
@@ -26,7 +26,6 @@ class RoiPack:
         self: "RoiPack", h5, base_group: str = "/"
     ) -> Tuple[
         Dict[Tuple[str, str, str], str], Dict[Tuple[str, str], list[Tuple[str, str]]]
-    ]:
     ]:
         """
         Build indices from an opened HDF5 file, relative to base_group.
