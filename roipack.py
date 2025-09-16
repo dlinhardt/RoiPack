@@ -134,32 +134,61 @@ class RoiPack:
         # Default to root if no grids (legacy files)
         return "/"
 
-    def select_grid_for_input(self, path_or_img, round_dec: int = 6) -> str:
-        """Select appropriate grid based on an input image (surface vs volume).
-        - For GIFTI (surface), clears grid_id (uses root surface masks).
-        - For NIfTI (volume), computes grid id and validates presence in file.
-        Returns the selected grid id ("surface" as a label for surface mode).
-        """
-        # Load image
-        if isinstance(path_or_img, (str, Path)):
-            img = nib.load(str(path_or_img))
-        else:
-            img = path_or_img
+    def select_grid_for_input(self, arg, round_dec: int = 6) -> str:
+        """Select appropriate grid based on a single argument (string or image).
 
-        # Surface: GIFTI
+        Argument can be:
+        - A space label string: one of {"volume", "fsnative", "fsaverage", "surface"}
+        - A path string to an image (NIfTI → volume; GIFTI → surface)
+        - A nibabel image object (NIfTI-like or GIFTI)
+
+        Returns the selected volume grid id, or "surface" when selecting surface mode.
+        """
+
+        if arg is None:
+            raise ValueError("select_grid_for_input requires a string (label or path) or an image object")
+
+        # If a string, decide whether it's a space label or a file path
+        if isinstance(arg, (str, Path)):
+            s = str(arg)
+            lbl = s.lower()
+            # Case 1: label
+            if lbl in {"volume", "fsnative", "fsaverage", "surface"}:
+                if lbl in {"fsnative", "fsaverage", "surface"}:
+                    # Surface mode
+                    self.grid_id = None
+                    # Also update meta hint so base group resolves to root
+                    self.meta["analysis_space"] = lbl if lbl != "surface" else "fsnative"
+                    return "surface"
+                # Volume label without image: auto-select if single grid exists
+                with h5py.File(str(self.h5_path), "r") as f:
+                    if "grids" in f:
+                        grids = list(f["grids"].keys())
+                        if len(grids) == 1:
+                            self.grid_id = grids[0]
+                            self.meta["analysis_space"] = "volume"
+                            return grids[0]
+                        raise KeyError(
+                            f"Multiple grids available {grids}; provide an image to disambiguate."
+                        )
+                    raise KeyError("No grids group found; cannot select volume without image")
+            # Case 2: path to image → load it and proceed below
+            img = nib.load(s)
+        else:
+            # Treat as nibabel image
+            img = arg
+
+        # Surface: GIFTI has 'agg_data'
         if hasattr(img, "agg_data"):
-            # Clear selection for surface mode
             self.grid_id = None
-            # Reset caches to force reindex under root
-            self._by_key = None
-            self._by_roi = None
+            self.meta["analysis_space"] = "fsnative"
             return "surface"
 
         # Volume: NIfTI-like
         shape = getattr(img, "shape", None)
         affine = getattr(img, "affine", None)
         if shape is None or affine is None:
-            raise ValueError("Unsupported image object; expected nibabel image or path")
+            raise ValueError("Unsupported image object; expected NIfTI-like with shape and affine")
         gid = self._grid_signature(shape[:3], affine, round_dec=round_dec)
         with h5py.File(str(self.h5_path), "r") as f:
             if f.get(f"/grids/{gid}") is None:
@@ -167,9 +196,7 @@ class RoiPack:
                     f"Grid {gid} not found in ROI pack (available: {list(f.get('grids', {}).keys()) if 'grids' in f else 'none'})"
                 )
         self.grid_id = gid
-        # Reset caches so index is reloaded under the selected grid
-        self._by_key = None
-        self._by_roi = None
+        self.meta["analysis_space"] = "volume"
         return gid
 
     # --------------------------------- API ------------------------------------
@@ -428,29 +455,3 @@ class RoiPack:
             indptr = ug["indptr"][()]
             indices = ug["indices"][()]
             return indices[indptr[i] : indptr[i + 1]].astype(np.int32)
-
-        """
-        get ROI positions in the union index
-            # Load BOLD (X,Y,Z,T)
-            img  = nib.load(str(in_path))
-            data = img.get_fdata(dtype=np.float32)
-            X,Y,Z,T = data.shape
-
-            # 1) extract only union voxels once:
-            u = roi_pack.get_union_index()              # shape (n_union,)
-            vox_ts = data.reshape(-1, T)[u]             # shape (n_union, T)
-
-            # 2) any ROI (overlaps allowed) → slice rows by positions:
-            pos_v1l_wang   = roi_pack.get_roi_positions("wang",   "V1", "l")
-            pos_v1l_benson = roi_pack.get_roi_positions("benson", "V1", "l")
-
-            ts_v1l_wang   = vox_ts[pos_v1l_wang]        # (n_wang, T)
-            ts_v1l_benson = vox_ts[pos_v1l_benson]      # (n_benson, T)
-
-            # combine (union) or intersect as needed:
-            pos_union = np.unique(np.concatenate([pos_v1l_wang, pos_v1l_benson]))
-            pos_inter = np.intersect1d(pos_v1l_wang, pos_v1l_benson, assume_unique=False)
-
-            ts_union = vox_ts[pos_union]
-            ts_inter = vox_ts[pos_inter]
-        """
