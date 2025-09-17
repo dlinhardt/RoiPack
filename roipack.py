@@ -430,7 +430,8 @@ class RoiPack:
         """
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
-            ug = f[base + "/union"] if base != "/" else f["union"]
+            gbase = f if base in ("/", None) else f[base]
+            ug = gbase["union"]
             return ug["flat_index"][()].astype(np.int32)
 
     def get_roi_positions(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
@@ -439,7 +440,8 @@ class RoiPack:
         """
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
-            ug = f[base + "/union"] if base != "/" else f["union"]
+            gbase = f if base in ("/", None) else f[base]
+            ug = gbase["union"]
             atlas_arr = ug["atlas"][()].astype(str)
             roi_arr = ug["roi"][()].astype(str)
             hemi_arr = ug["hemi"][()].astype(str)
