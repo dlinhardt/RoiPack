@@ -1,4 +1,9 @@
+# roipack.py
+
+from __future__ import annotations
+
 import hashlib
+import json
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional, Tuple
 
@@ -8,32 +13,47 @@ import numpy as np
 
 
 class RoiPack:
-    def __init__(self, key: str, h5_path: Path | str, meta: dict):
-        self.key = str(key)
+    """Reader/utility for ROI mask packs.
+
+    Parameters
+    ----------
+    key : str
+        Cache key identifying this pack's meta combination.
+    h5_path : Path | str
+        Path to the HDF5 file containing the masks.
+    meta : dict
+        Canonical metadata dictionary (includes 'analysis_space').
+    grid_id : str | None, optional
+        For volume mode, an explicitly chosen grid id if multiple are present.
+    """
+
+    def __init__(
+        self, key: str, h5_path: Path | str, meta: dict, grid_id: str | None = None
+    ):
+        self.key = key
         self.h5_path = Path(h5_path)
         self.meta = dict(meta)
-        self._by_key: Optional[Dict[Tuple[str, str, str], str]] = (
-            None  # (atlas, roi, hemi) -> h5 path
-        )
-        self._by_roi: Optional[Dict[Tuple[str, str], list[Tuple[str, str]]]] = (
-            None  # (atlas, roi) -> [(hemi, path)]
-        )
-        # For volume mode, selected grid id; None means surface or not selected
-        self.grid_id: Optional[str] = None
+        self.grid_id = grid_id
+        self._by_key = None  # lazy: (atlas, roi, hemi) -> h5 dataset path
+        self._by_roi = None  # lazy: (atlas, roi) -> list[(hemi, path)]
 
-    # ------------------------------- helpers -------------------------------------
+    # --------------------------- index building ---------------------------
+
+    @staticmethod
     def _load_index(
-        self: "RoiPack", h5, base_group: str = "/"
+        h5: h5py.File, base_group: str = "/"
     ) -> Tuple[
         Dict[Tuple[str, str, str], str], Dict[Tuple[str, str], list[Tuple[str, str]]]
     ]:
+        """Build indices from an opened HDF5 file, relative to base_group.
+
+        Returns
+        -------
+        by_key : dict
+            Mapping (atlas, roi, hemi) -> dataset path string.
+        by_roi : dict
+            Mapping (atlas, roi) -> list of (hemi, dataset path) tuples.
         """
-        Build indices from an opened HDF5 file, relative to base_group.
-        Returns:
-        by_key: (atlas, roi, hemi) -> h5_path
-        by_roi: (atlas, roi) -> [(hemi, h5_path), ...]
-        """
-        # resolve base
         gbase = h5 if base_group in ("/", None) else h5[base_group]
 
         idx = []
@@ -87,6 +107,29 @@ class RoiPack:
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
             self._by_key, self._by_roi = self._load_index(f, base_group=base)
+
+    # --------------------------- dataset helpers ---------------------------
+
+    @staticmethod
+    def _dense_from_dataset(d: h5py.Dataset) -> np.ndarray:
+        """Reconstruct a dense boolean mask from a stored dataset.
+
+        Supports only index-based storage (current schema). Older bool modes
+        are intentionally not supported to keep the code path minimal.
+        """
+        kind = d.attrs.get("kind")
+        if kind != "index":
+            # Treat any non-index as legacy dense array: convert nonzero to True
+            arr = d[()]
+            return np.asarray(arr) != 0
+        full_shape = tuple(map(int, d.attrs.get("full_shape", ())))
+        if not full_shape:
+            raise ValueError("Missing full_shape attribute for index mask")
+        flat = np.zeros(np.prod(full_shape, dtype=int), dtype=bool)
+        idx = d[()].astype(np.int64)
+        if idx.size:
+            flat[idx] = True
+        return flat.reshape(full_shape)
 
     # ---------------------------- grid selection -----------------------------
 
@@ -146,7 +189,9 @@ class RoiPack:
         """
 
         if arg is None:
-            raise ValueError("select_grid_for_input requires a string (label or path) or an image object")
+            raise ValueError(
+                "select_grid_for_input requires a string (label or path) or an image object"
+            )
 
         # If a string, decide whether it's a space label or a file path
         if isinstance(arg, (str, Path)):
@@ -158,7 +203,9 @@ class RoiPack:
                     # Surface mode
                     self.grid_id = None
                     # Also update meta hint so base group resolves to root
-                    self.meta["analysis_space"] = lbl if lbl != "surface" else "fsnative"
+                    self.meta["analysis_space"] = (
+                        lbl if lbl != "surface" else "fsnative"
+                    )
                     return "surface"
                 # Volume label without image: auto-select if single grid exists
                 with h5py.File(str(self.h5_path), "r") as f:
@@ -171,7 +218,9 @@ class RoiPack:
                         raise KeyError(
                             f"Multiple grids available {grids}; provide an image to disambiguate."
                         )
-                    raise KeyError("No grids group found; cannot select volume without image")
+                    raise KeyError(
+                        "No grids group found; cannot select volume without image"
+                    )
             # Case 2: path to image → load it and proceed below
             img = nib.load(s)
         else:
@@ -188,7 +237,9 @@ class RoiPack:
         shape = getattr(img, "shape", None)
         affine = getattr(img, "affine", None)
         if shape is None or affine is None:
-            raise ValueError("Unsupported image object; expected NIfTI-like with shape and affine")
+            raise ValueError(
+                "Unsupported image object; expected NIfTI-like with shape and affine"
+            )
         gid = self._grid_signature(shape[:3], affine, round_dec=round_dec)
         with h5py.File(str(self.h5_path), "r") as f:
             if f.get(f"/grids/{gid}") is None:
@@ -280,11 +331,7 @@ class RoiPack:
         if path is None:
             raise KeyError(f"Mask not found: (atlas={atlas}, roi={roi}, hemi={hemi})")
         with h5py.File(str(self.h5_path), "r") as f:
-            d = f[path]
-            arr = d[()]
-            if d.attrs.get("kind") == "bool":
-                arr = arr.astype(bool)
-            return arr
+            return self._dense_from_dataset(f[path])
 
     def get_both(self, atlas: str, roi: str) -> dict:
         """
@@ -296,19 +343,11 @@ class RoiPack:
             for hemi in ("l", "r"):
                 path = self._by_key.get((atlas, roi, hemi))
                 if path is not None:
-                    d = f[path]
-                    arr = d[()]
-                    if d.attrs.get("kind") == "bool":
-                        arr = arr.astype(bool)
-                    out[hemi] = arr
+                    out[hemi] = self._dense_from_dataset(f[path])
             if not out:
                 path = self._by_key.get((atlas, roi, "both"))
                 if path is not None:
-                    d = f[path]
-                    arr = d[()]
-                    if d.attrs.get("kind") == "bool":
-                        arr = arr.astype(bool)
-                    out["both"] = arr
+                    out["both"] = self._dense_from_dataset(f[path])
         if not out:
             raise KeyError(f"No hemispheres available for (atlas={atlas}, roi={roi})")
         return out
@@ -365,14 +404,7 @@ class RoiPack:
                     continue
                 if H is not None and h not in H:
                     continue
-                d = f[path]
-                arr = d[()]
-                # normalize to bool
-                if d.attrs.get("kind") == "bool":
-                    arr = arr.astype(bool)
-                else:
-                    # 0/1 or labelmaps → treat nonzero as True
-                    arr = np.asarray(arr) != 0
+                arr = self._dense_from_dataset(f[path])
                 # initialize / validate shape
                 if out is None:
                     out = arr.copy()
@@ -424,19 +456,68 @@ class RoiPack:
             "atlases": per_atlas,
         }
 
-    def get_union_index(self):
-        """Return union flat indices (global voxel indices) into the selected grid.
-        For surface, returns indices into the flattened 1D vertex array.
+    def get_union_index(self, hemi: Optional[str] = None) -> np.ndarray:
+        """Return union flat indices (global indices into original space).
+
+        Layouts handled:
+        - Unified (volume or new surface): /union with datasets including flat_index.
+
+                If a unified surface concatenation (grid_order == 'vertex_concat') is present:
+                    - Attributes 'hemi_order' (array of hemisphere labels) and 'hemi_offsets'
+                        (array of starting offsets) define the concatenation layout.
+                    - When a hemisphere is specified, the returned indices are localized
+                        to that hemisphere (i.e. returned indices are in that hemi's local
+                        vertex index space, not the concatenated global space).
         """
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
-            gbase = f if base in ("/", None) else f[base]
-            ug = gbase["union"]
-            return ug["flat_index"][()].astype(np.int32)
+            ug = f[base + "/union"] if base != "/" else f["union"]
+            if "flat_index" in ug:  # unified union (volume or new surface)
+                flat = ug["flat_index"][()].astype(np.int32)
+                grid_order = ug.attrs.get("grid_order", "")
+                # Volume hemisphere filtering via stored hemi_l_idx / hemi_r_idx
+                if grid_order == "C" and hemi is not None:
+                    hemi_key = f"hemi_{hemi}_idx"
+                    if hemi_key in ug:
+                        # Return only union indices that belong to this hemi by intersecting
+                        hemi_idx = ug[hemi_key][()]
+                        # hemi_idx are original-space voxel indices
+                        # We need the subset of union 'flat' that are in hemi_idx, preserving order
+                        mask = np.isin(flat, hemi_idx)
+                        return flat[mask]
+                if grid_order == "vertex_concat" and hemi is not None:
+                    # Preferred attributes
+                    hemi_ranges = None
+                    if "hemi_order" in ug.attrs and "hemi_offsets" in ug.attrs:
+                        hemi_order = [
+                            h.decode() if isinstance(h, bytes) else h
+                            for h in ug.attrs["hemi_order"]
+                        ]
+                        hemi_offsets = list(map(int, ug.attrs["hemi_offsets"]))
+                        pairs = list(zip(hemi_order, hemi_offsets))
+                        pairs.sort(key=lambda kv: kv[1])
+                        hemi_ranges = {}
+                        for i, (hh, st) in enumerate(pairs):
+                            en = (
+                                pairs[i + 1][1]
+                                if i + 1 < len(pairs)
+                                else (int(flat.max()) + 1 if flat.size else st)
+                            )
+                            hemi_ranges[hh] = (st, en)
+                    if hemi_ranges:
+                        if hemi not in hemi_ranges:
+                            raise KeyError(
+                                f"Requested hemi '{hemi}' not present in union offsets {list(hemi_ranges.keys())}"
+                            )
+                        st, en = hemi_ranges[hemi]
+                        mask = (flat >= st) & (flat < en)
+                        return (flat[mask] - st).astype(np.int32)
+                return flat
 
     def get_roi_positions(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
-        """
-        Return union-row positions (0..n_union-1) for this ROI, for the selected base group.
+        """Return union-order positions for an ROI.
+
+        Works with unified (volume or concatenated surface).
         """
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
@@ -445,15 +526,29 @@ class RoiPack:
             atlas_arr = ug["atlas"][()].astype(str)
             roi_arr = ug["roi"][()].astype(str)
             hemi_arr = ug["hemi"][()].astype(str)
-            # locate row index i
-            # (for speed, cache a dict[{(a,r,h)->i}] on first call if you like)
+            indptr = ug["indptr"][()]
+            indices = ug["indices"][()]
+            # find row
             i = None
             for k, (a, r, h) in enumerate(zip(atlas_arr, roi_arr, hemi_arr)):
                 if a == atlas and r == roi and h == hemi:
                     i = k
                     break
             if i is None:
-                raise KeyError(f"ROI not found: {(atlas, roi, hemi)}")
-            indptr = ug["indptr"][()]
-            indices = ug["indices"][()]
+                raise KeyError(f"ROI not found in union: {(atlas, roi, hemi)}")
             return indices[indptr[i] : indptr[i + 1]].astype(np.int32)
+
+    def get_roi_flat_indices(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
+        """Convenience: return original-space flat indices for an ROI via union mapping.
+
+        This composes get_union_index(hemi=hemi) and get_roi_positions(atlas, roi, hemi)
+        so callers can directly obtain the flat indices into the original vertex/voxel grid.
+        """
+        # Determine if surface per-hemi union is present by attempting hemi lookup
+        try:
+            union_flat = self.get_union_index(hemi=hemi)
+        except (ValueError, KeyError):
+            # Fall back to single union (volume or legacy layout)
+            union_flat = self.get_union_index()
+        pos = self.get_roi_positions(atlas, roi, hemi)
+        return union_flat[pos]
