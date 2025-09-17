@@ -459,84 +459,52 @@ class RoiPack:
     def get_union_index(self, hemi: Optional[str] = None) -> np.ndarray:
         """Return union flat indices (global indices into original space).
 
-        Layouts handled:
-        - Unified (volume or new surface): /union with datasets including flat_index.
-
-                If a unified surface concatenation (grid_order == 'vertex_concat') is present:
-                    - Attributes 'hemi_order' (array of hemisphere labels) and 'hemi_offsets'
-                        (array of starting offsets) define the concatenation layout.
-                    - When a hemisphere is specified, the returned indices are localized
-                        to that hemisphere (i.e. returned indices are in that hemi's local
-                        vertex index space, not the concatenated global space).
+        Layout now expected:
+        - Per-hemisphere groups: /union/l and /union/r each with flat_index etc.
+          (Both surface and volume modes share this schema.)
         """
+        if hemi is None:
+            raise ValueError("hemi must be specified ('l' or 'r') for per-hemi union schema")
+        hemi = hemi.lower()
+        if hemi not in ("l","r"):
+            raise ValueError("hemi must be 'l' or 'r'")
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
-            ug = f[base + "/union"] if base != "/" else f["union"]
-            if "flat_index" in ug:  # unified union (volume or new surface)
-                flat = ug["flat_index"][()].astype(np.int32)
-                grid_order = ug.attrs.get("grid_order", "")
-                # Volume hemisphere filtering via stored hemi_l_idx / hemi_r_idx
-                if grid_order == "C" and hemi is not None:
-                    hemi_key = f"hemi_{hemi}_idx"
-                    if hemi_key in ug:
-                        # Return only union indices that belong to this hemi by intersecting
-                        hemi_idx = ug[hemi_key][()]
-                        # hemi_idx are original-space voxel indices
-                        # We need the subset of union 'flat' that are in hemi_idx, preserving order
-                        mask = np.isin(flat, hemi_idx)
-                        return flat[mask]
-                if grid_order == "vertex_concat" and hemi is not None:
-                    # Preferred attributes
-                    hemi_ranges = None
-                    if "hemi_order" in ug.attrs and "hemi_offsets" in ug.attrs:
-                        hemi_order = [
-                            h.decode() if isinstance(h, bytes) else h
-                            for h in ug.attrs["hemi_order"]
-                        ]
-                        hemi_offsets = list(map(int, ug.attrs["hemi_offsets"]))
-                        pairs = list(zip(hemi_order, hemi_offsets))
-                        pairs.sort(key=lambda kv: kv[1])
-                        hemi_ranges = {}
-                        for i, (hh, st) in enumerate(pairs):
-                            en = (
-                                pairs[i + 1][1]
-                                if i + 1 < len(pairs)
-                                else (int(flat.max()) + 1 if flat.size else st)
-                            )
-                            hemi_ranges[hh] = (st, en)
-                    if hemi_ranges:
-                        if hemi not in hemi_ranges:
-                            raise KeyError(
-                                f"Requested hemi '{hemi}' not present in union offsets {list(hemi_ranges.keys())}"
-                            )
-                        st, en = hemi_ranges[hemi]
-                        mask = (flat >= st) & (flat < en)
-                        return (flat[mask] - st).astype(np.int32)
-                return flat
+            gbase = f if base in ("/", None) else f[base]
+            path = f"union/{hemi}"
+            if path not in gbase:
+                raise KeyError(f"Union group for hemi '{hemi}' not found at {gbase.name}/{path}")
+            ug = gbase[path]
+            if "flat_index" not in ug:
+                raise KeyError(f"flat_index dataset missing in {ug.name}")
+            return ug["flat_index"][()].astype(np.int32)
 
     def get_roi_positions(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
         """Return union-order positions for an ROI.
 
-        Works with unified (volume or concatenated surface).
+        Works with per-hemi union layout (/union/<hemi>/...).
         """
+        hemi_l = hemi.lower()
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
             gbase = f if base in ("/", None) else f[base]
-            ug = gbase["union"]
+            path = f"union/{hemi_l}"
+            if path not in gbase:
+                raise KeyError(f"Union group for hemi '{hemi}' not found")
+            ug = gbase[path]
             atlas_arr = ug["atlas"][()].astype(str)
             roi_arr = ug["roi"][()].astype(str)
-            hemi_arr = ug["hemi"][()].astype(str)
+            hemi_arr = ug["hemi"][()][:].astype(str)
             indptr = ug["indptr"][()]
             indices = ug["indices"][()]
-            # find row
             i = None
             for k, (a, r, h) in enumerate(zip(atlas_arr, roi_arr, hemi_arr)):
-                if a == atlas and r == roi and h == hemi:
+                if a == atlas and r == roi and h == hemi_l:
                     i = k
                     break
             if i is None:
-                raise KeyError(f"ROI not found in union: {(atlas, roi, hemi)}")
-            return indices[indptr[i] : indptr[i + 1]].astype(np.int32)
+                raise KeyError(f"ROI not found in hemi union: {(atlas, roi, hemi)}")
+            return indices[indptr[i]:indptr[i+1]].astype(np.int32)
 
     def get_roi_flat_indices(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
         """Convenience: return original-space flat indices for an ROI via union mapping.
@@ -544,11 +512,6 @@ class RoiPack:
         This composes get_union_index(hemi=hemi) and get_roi_positions(atlas, roi, hemi)
         so callers can directly obtain the flat indices into the original vertex/voxel grid.
         """
-        # Determine if surface per-hemi union is present by attempting hemi lookup
-        try:
-            union_flat = self.get_union_index(hemi=hemi)
-        except (ValueError, KeyError):
-            # Fall back to single union (volume or legacy layout)
-            union_flat = self.get_union_index()
+        union_flat = self.get_union_index(hemi=hemi)
         pos = self.get_roi_positions(atlas, roi, hemi)
         return union_flat[pos]
