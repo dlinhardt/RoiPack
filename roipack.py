@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Optional, Tuple
+from typing import Optional
 
 import h5py
 import nibabel as nib
@@ -13,7 +13,7 @@ import numpy as np
 
 
 class RoiPack:
-    """Reader/utility for ROI mask packs.
+    """Simplified reader for ROI mask packs with original_space and masked_space structure.
 
     Parameters
     ----------
@@ -34,104 +34,8 @@ class RoiPack:
         self.h5_path = Path(h5_path)
         self.meta = dict(meta)
         self.grid_id = grid_id
-        self._by_key = None  # lazy: (atlas, roi, hemi) -> h5 dataset path
-        self._by_roi = None  # lazy: (atlas, roi) -> list[(hemi, path)]
 
-    # --------------------------- index building ---------------------------
-
-    @staticmethod
-    def _load_index(
-        h5: h5py.File, base_group: str = "/"
-    ) -> Tuple[
-        Dict[Tuple[str, str, str], str], Dict[Tuple[str, str], list[Tuple[str, str]]]
-    ]:
-        """Build indices from an opened HDF5 file, relative to base_group.
-
-        Returns
-        -------
-        by_key : dict
-            Mapping (atlas, roi, hemi) -> dataset path string.
-        by_roi : dict
-            Mapping (atlas, roi) -> list of (hemi, dataset path) tuples.
-        """
-        gbase = h5 if base_group in ("/", None) else h5[base_group]
-
-        idx = []
-        if "index" in gbase:
-            atlas = list(gbase["index/atlas"][...])
-            roi = list(gbase["index/roi"][...])
-            hemi = list(gbase["index/hemi"][...])
-            path = list(gbase["index/path"][...])
-            for a, r, h, p in zip(atlas, roi, hemi, path):
-                if isinstance(a, bytes):
-                    a = a.decode()
-                if isinstance(r, bytes):
-                    r = r.decode()
-                if isinstance(h, bytes):
-                    h = h.decode()
-                if isinstance(p, bytes):
-                    p = p.decode()
-                idx.append((a, r, h, p))
-        else:
-            g_masks = gbase.get("masks")
-            if g_masks is not None:
-                for atlas in g_masks:
-                    g_atlas = g_masks[atlas]
-                    for roi in g_atlas:
-                        g_roi = g_atlas[roi]
-                        for hemi in g_roi:
-                            idx.append(
-                                (
-                                    atlas,
-                                    roi,
-                                    hemi,
-                                    f"{g_masks.name}/{atlas}/{roi}/{hemi}",
-                                )
-                            )
-
-        by_key = {(a, r, h): p for (a, r, h, p) in idx}
-        by_roi: Dict[Tuple[str, str], list[Tuple[str, str]]] = {}
-        for a, r, h, p in idx:
-            by_roi.setdefault((a, r), []).append((h, p))
-        return by_key, by_roi
-
-    def _ensure_index(self) -> None:
-        """Ensure that the internal indices are loaded from the HDF5 file.
-
-        This method lazily loads the by_key and by_roi indices from the HDF5 file
-        if they haven't been loaded yet. It uses the current base group based on
-        the selected grid or surface mode.
-        """
-        if self._by_key is not None:
-            return
-        with h5py.File(str(self.h5_path), "r") as f:
-            base = self._resolve_base_group(f)
-            self._by_key, self._by_roi = self._load_index(f, base_group=base)
-
-    # --------------------------- dataset helpers ---------------------------
-
-    @staticmethod
-    def _dense_from_dataset(d: h5py.Dataset) -> np.ndarray:
-        """Reconstruct a dense boolean mask from a stored dataset.
-
-        Supports only index-based storage (current schema). Older bool modes
-        are intentionally not supported to keep the code path minimal.
-        """
-        kind = d.attrs.get("kind")
-        if kind != "index":
-            # Treat any non-index as legacy dense array: convert nonzero to True
-            arr = d[()]
-            return np.asarray(arr) != 0
-        full_shape = tuple(map(int, d.attrs.get("full_shape", ())))
-        if not full_shape:
-            raise ValueError("Missing full_shape attribute for index mask")
-        flat = np.zeros(np.prod(full_shape, dtype=int), dtype=bool)
-        idx = d[()].astype(np.int64)
-        if idx.size:
-            flat[idx] = True
-        return flat.reshape(full_shape)
-
-    # ---------------------------- grid selection -----------------------------
+    # --------------------------- grid selection ---------------------------
 
     @staticmethod
     def _grid_signature(shape, affine, round_dec: int = 6) -> str:
@@ -250,268 +154,278 @@ class RoiPack:
         self.meta["analysis_space"] = "volume"
         return gid
 
-    # --------------------------------- API ------------------------------------
+    # --------------------------------- Core API ------------------------------------
 
-    def has(self, atlas: str, roi: str, hemi: str) -> bool:
-        """Check if a specific ROI mask exists in the pack.
+    def get_original_space_indices(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
+        """Get indices for ROI in original coordinate space (vertices/voxels).
 
         Parameters
         ----------
         atlas : str
-            The atlas name (e.g., 'benson', 'wang').
+            Atlas name (e.g., 'benson', 'wang', 'fullBrain')
         roi : str
-            The ROI name (e.g., 'V1', 'V2').
+            ROI name (e.g., 'V1', 'V2')
         hemi : str
-            The hemisphere ('l', 'r', or 'both').
+            Hemisphere ('l' or 'r')
 
         Returns
         -------
-        bool
-            True if the ROI mask exists, False otherwise.
+        np.ndarray
+            Flat indices into original coordinate space where ROI is active
         """
-        self._ensure_index()
-        return (atlas, roi, hemi) in self._by_key  # type: ignore[operator]
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            path = f"original_space/{atlas}/{roi}/{hemi}"
+            if path not in gbase:
+                raise KeyError(f"ROI not found: {atlas}/{roi}/{hemi}")
+
+            return gbase[path][()].astype(np.int32)
+
+    def get_masked_space_indices(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
+        """Get indices for ROI in masked coordinate space (compressed).
+
+        Parameters
+        ----------
+        atlas : str
+            Atlas name (e.g., 'benson', 'wang', 'fullBrain')
+        roi : str
+            ROI name (e.g., 'V1', 'V2')
+        hemi : str
+            Hemisphere ('l' or 'r')
+
+        Returns
+        -------
+        np.ndarray
+            Indices into masked space where ROI is active
+        """
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            path = f"masked_space/{atlas}/{roi}/{hemi}"
+            if path not in gbase:
+                raise KeyError(f"ROI not found in masked space: {atlas}/{roi}/{hemi}")
+
+            return gbase[path][()].astype(np.int32)
+
+    def get_masked_space_flat_index(self, hemi: str) -> np.ndarray:
+        """Get mapping from masked space to original space for a hemisphere.
+
+        Parameters
+        ----------
+        hemi : str
+            Hemisphere ('l' or 'r')
+
+        Returns
+        -------
+        np.ndarray
+            Flat indices mapping masked space positions to original space
+        """
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            flat_index_key = f"flat_index_{hemi}"
+            if f"masked_space/{flat_index_key}" not in gbase:
+                raise KeyError(
+                    f"Masked space flat index not found for hemisphere {hemi}"
+                )
+
+            return gbase[f"masked_space/{flat_index_key}"][()].astype(np.int32)
+
+    def get_grid_shape(self) -> tuple[int, int, int]:
+        """Get the 3D shape of the current volume grid.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            Shape (nx, ny, nz) of the volume grid
+
+        Raises
+        ------
+        ValueError
+            If not in volume mode or no grid selected
+        KeyError
+            If shape information not found in HDF5 file
+        """
+        space = str(self.meta.get("analysis_space", "")).lower()
+        if space in ("fsnative", "fsaverage"):
+            raise ValueError("get_grid_shape() only available in volume mode")
+
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            # Try to find any dataset with full_shape attribute
+            for space_type in ["original_space", "masked_space"]:
+                if space_type in gbase:
+                    space_group = gbase[space_type]
+                    for atlas_name in space_group:
+                        atlas_group = space_group[atlas_name]
+                        for roi_name in atlas_group:
+                            roi_group = atlas_group[roi_name]
+                            for hemi_name in roi_group:
+                                dataset = roi_group[hemi_name]
+                                if "full_shape" in dataset.attrs:
+                                    shape = tuple(dataset.attrs["full_shape"])
+                                    return shape
+
+            raise KeyError("No grid shape information found in HDF5 file")
+
+    def get_original_space_coordinates(
+        self, atlas: str, roi: str, hemi: str
+    ) -> np.ndarray:
+        """Get 3D coordinates for ROI in volume space.
+
+        Parameters
+        ----------
+        atlas : str
+            Atlas name (e.g., 'benson', 'wang', 'fullBrain')
+        roi : str
+            ROI name (e.g., 'V1', 'V2')
+        hemi : str
+            Hemisphere ('l' or 'r')
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape (n_voxels, 3) with (i, j, k) coordinates
+
+        Raises
+        ------
+        ValueError
+            If not in volume mode
+        """
+        space = str(self.meta.get("analysis_space", "")).lower()
+        if space in ("fsnative", "fsaverage"):
+            raise ValueError(
+                "get_original_space_coordinates() only available in volume mode"
+            )
+
+        flat_indices = self.get_original_space_indices(atlas, roi, hemi)
+        if flat_indices.size == 0:
+            return np.array([], dtype=int).reshape(0, 3)
+
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            try:
+                grid_shape = np.array(gbase.attrs["grid_shape"]).astype(float)
+            except KeyError:
+                raise KeyError("Grid shape attribute not found in HDF5 file")
+
+        coordinates = np.vstack(np.unravel_index(flat_indices, grid_shape)).T
+        return coordinates.astype(np.int32)
+
+    # --------------------------------- Utility methods ------------------------------------
+
+    def has_roi(self, atlas: str, roi: str, hemi: str) -> bool:
+        """Check if ROI exists in original space."""
+        try:
+            self.get_original_space_indices(atlas, roi, hemi)
+            return True
+        except KeyError:
+            return False
 
     def list_atlases(self) -> list[str]:
-        """Get a sorted list of all available atlas names in the pack.
+        """Get sorted list of available atlases."""
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
 
-        Returns
-        -------
-        list[str]
-            Sorted list of atlas names.
-        """
-        self._ensure_index()
-        return sorted({a for (a, r, h) in self._by_key.keys()})
+            if "original_space" not in gbase:
+                return []
+
+            return sorted(list(gbase["original_space"].keys()))
 
     def list_rois(self, atlas: str) -> list[str]:
-        """Get a sorted list of all ROI names for a specific atlas.
+        """Get sorted list of ROIs for an atlas."""
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            atlas_path = f"original_space/{atlas}"
+            if atlas_path not in gbase:
+                return []
+
+            return sorted(list(gbase[atlas_path].keys()))
+
+    def list_hemispheres(self, atlas: str, roi: str) -> list[str]:
+        """Get available hemispheres for an atlas/ROI combination."""
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            roi_path = f"original_space/{atlas}/{roi}"
+            if roi_path not in gbase:
+                return []
+
+            return sorted(list(gbase[roi_path].keys()))
+
+    def get_dense_mask(
+        self, atlas: str, roi: str, hemi: str, shape: tuple
+    ) -> np.ndarray:
+        """Convert sparse indices to dense boolean mask.
 
         Parameters
         ----------
         atlas : str
-            The atlas name to list ROIs for.
+            Atlas name
+        roi : str
+            ROI name
+        hemi : str
+            Hemisphere
+        shape : tuple
+            Shape of the output mask
 
         Returns
         -------
-        list[str]
-            Sorted list of ROI names for the specified atlas.
+        np.ndarray
+            Dense boolean mask with True where ROI is active
         """
-        self._ensure_index()
-        return sorted({r for (a, r, h) in self._by_key.keys() if a == atlas})
+        indices = self.get_original_space_indices(atlas, roi, hemi)
+        mask = np.zeros(np.prod(shape), dtype=bool)
+        if indices.size > 0:
+            mask[indices] = True
+        return mask.reshape(shape)
 
-    def find(
-        self,
-        atlas: Optional[Iterable[str] | str] = None,
-        roi: Optional[Iterable[str] | str] = None,
-        hemi: Optional[Iterable[str] | str] = None,
-    ) -> Iterator[Tuple[Tuple[str, str, str], str]]:
-        """
-        Iterate ((atlas, roi, hemi), hdf5_path) matching filters. Any filter can be None or a collection.
-        """
-        self._ensure_index()
-
-        def _ok(val, flt):
-            if flt is None:
-                return True
-            if isinstance(flt, (list, tuple, set)):
-                return val in flt
-            return val == flt
-
-        for k, p in self._by_key.items():
-            a, r, h = k
-            if _ok(a, atlas) and _ok(r, roi) and _ok(h, hemi):
-                yield k, p
-
-    def get(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
-        """
-        Load a single mask (numpy array) for (atlas, roi, hemi).
-        """
-        self._ensure_index()
-        path = self._by_key.get((atlas, roi, hemi))
-        if path is None:
-            raise KeyError(f"Mask not found: (atlas={atlas}, roi={roi}, hemi={hemi})")
-        with h5py.File(str(self.h5_path), "r") as f:
-            return self._dense_from_dataset(f[path])
-
-    def get_both(self, atlas: str, roi: str) -> dict:
-        """
-        Returns {'l': arr, 'r': arr} if available; else {'both': arr} for volume fullBrain.
-        """
-        self._ensure_index()
-        out = {}
-        with h5py.File(str(self.h5_path), "r") as f:
-            for hemi in ("l", "r"):
-                path = self._by_key.get((atlas, roi, hemi))
-                if path is not None:
-                    out[hemi] = self._dense_from_dataset(f[path])
-            if not out:
-                path = self._by_key.get((atlas, roi, "both"))
-                if path is not None:
-                    out["both"] = self._dense_from_dataset(f[path])
-        if not out:
-            raise KeyError(f"No hemispheres available for (atlas={atlas}, roi={roi})")
-        return out
-
-    def _normalize_filter(self, val):
-        """Normalize filter values for consistent processing.
+    def convert_masked_to_original(
+        self, masked_indices: np.ndarray, hemi: str
+    ) -> np.ndarray:
+        """Convert masked space indices to original space indices.
 
         Parameters
         ----------
-        val : str, iterable, or None
-            The filter value to normalize. Can be None, 'all', a string, or an iterable.
+        masked_indices : np.ndarray
+            Indices in masked space
+        hemi : str Hemisphere
 
         Returns
         -------
-        None, set, or str
-            - None if val is None or 'all' (match everything)
-            - A set if val is an iterable
-            - A set containing the string if val is a string
+        np.ndarray
+            Corresponding indices in original space
         """
-        if val is None or (isinstance(val, str) and val.lower() == "all"):
-            return None
-        if isinstance(val, str):
-            return {val}
-        return set(val)
-
-    def get_union(
-        self,
-        hemi: str,
-        atlas: str | None = "all",
-        roi: str | None = "all",
-    ) -> np.ndarray:
-        """
-        Logical-OR across all masks matching the filters (atlas/roi/hemi).
-        Returns a single boolean array with the same shape as the masks.
-
-        Examples
-        --------
-        - All ROIs from all atlases in LH:   get_union(atlas="all", roi="all", hemi="l")
-        - All Benson ROIs in RH:             get_union(atlas="benson", roi="all", hemi="r")
-        - Specific list across hemis:        get_union(atlas=["benson","wang"], roi="V1", hemi=["l","r"])
-        """
-        self._ensure_index()
-        A = self._normalize_filter(atlas)
-        R = self._normalize_filter(roi)
-        H = self._normalize_filter(hemi)
-
-        out = None
-        shape0 = None
-        with h5py.File(str(self.h5_path), "r") as f:
-            for (a, r, h), path in self._by_key.items():
-                if A is not None and a not in A:
-                    continue
-                if R is not None and r not in R:
-                    continue
-                if H is not None and h not in H:
-                    continue
-                arr = self._dense_from_dataset(f[path])
-                # initialize / validate shape
-                if out is None:
-                    out = arr.copy()
-                    shape0 = out.shape
-                    # ensure we're not accidentally mixing surface & volume
-                    if out.ndim not in (1, 3):
-                        raise ValueError(f"Unexpected mask rank {out.ndim} at {path}")
-                else:
-                    if arr.shape != shape0:
-                        raise ValueError(
-                            f"Shape mismatch in union: {arr.shape} vs {shape0} at {path}"
-                        )
-                    out |= arr
-        if out is None:
-            raise KeyError(
-                f"No masks matched filters atlas={atlas}, roi={roi}, hemi={hemi}"
-            )
-        return out
-
-    def get_all(
-        self,
-        hemi: str,
-        atlas: str | None = "all",
-        roi: str | None = "all",
-    ) -> np.ndarray:
-        """Alias of get_union(...)."""
-        return self.get_union(atlas=atlas, roi=roi, hemi=hemi)
+        flat_index = self.get_masked_space_flat_index(hemi)
+        return flat_index[masked_indices]
 
     def summary(self) -> dict:
-        """
-        Small metadata snapshot: counts per atlas/hemi and example shapes.
-        """
-        self._ensure_index()
-        per_atlas = {}
-        with h5py.File(str(self.h5_path), "r") as f:
-            for (atlas, roi, hemi), path in self._by_key.items():
-                d = f[path]
-                shp = tuple(d.shape)
-                per_atlas.setdefault(atlas, {}).setdefault(
-                    hemi, {"count": 0, "example_shape": shp}
-                )
-                per_atlas[atlas][hemi]["count"] += 1
-                if "example_shape" not in per_atlas[atlas][hemi]:
-                    per_atlas[atlas][hemi]["example_shape"] = shp
-        return {
+        """Get summary of available data."""
+        atlases = self.list_atlases()
+        summary = {
             "key": self.key,
             "file": str(self.h5_path),
             "meta": self.meta,
-            "atlases": per_atlas,
+            "atlases": {},
         }
 
-    def get_union_index(self, hemi: Optional[str] = None) -> np.ndarray:
-        """Return union flat indices (global indices into original space).
+        for atlas in atlases:
+            rois = self.list_rois(atlas)
+            summary["atlases"][atlas] = {}
+            for roi in rois:
+                hemispheres = self.list_hemispheres(atlas, roi)
+                summary["atlases"][atlas][roi] = hemispheres
 
-        Layout now expected:
-        - Per-hemisphere groups: /union/l and /union/r each with flat_index etc.
-          (Both surface and volume modes share this schema.)
-        """
-        if hemi is None:
-            raise ValueError("hemi must be specified ('l' or 'r') for per-hemi union schema")
-        hemi = hemi.lower()
-        if hemi not in ("l","r"):
-            raise ValueError("hemi must be 'l' or 'r'")
-        with h5py.File(str(self.h5_path), "r") as f:
-            base = self._resolve_base_group(f)
-            gbase = f if base in ("/", None) else f[base]
-            path = f"union/{hemi}"
-            if path not in gbase:
-                raise KeyError(f"Union group for hemi '{hemi}' not found at {gbase.name}/{path}")
-            ug = gbase[path]
-            if "flat_index" not in ug:
-                raise KeyError(f"flat_index dataset missing in {ug.name}")
-            return ug["flat_index"][()].astype(np.int32)
-
-    def get_roi_positions(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
-        """Return union-order positions for an ROI.
-
-        Works with per-hemi union layout (/union/<hemi>/...).
-        """
-        hemi_l = hemi.lower()
-        with h5py.File(str(self.h5_path), "r") as f:
-            base = self._resolve_base_group(f)
-            gbase = f if base in ("/", None) else f[base]
-            path = f"union/{hemi_l}"
-            if path not in gbase:
-                raise KeyError(f"Union group for hemi '{hemi}' not found")
-            ug = gbase[path]
-            atlas_arr = ug["atlas"][()].astype(str)
-            roi_arr = ug["roi"][()].astype(str)
-            hemi_arr = ug["hemi"][()][:].astype(str)
-            indptr = ug["indptr"][()]
-            indices = ug["indices"][()]
-            i = None
-            for k, (a, r, h) in enumerate(zip(atlas_arr, roi_arr, hemi_arr)):
-                if a == atlas and r == roi and h == hemi_l:
-                    i = k
-                    break
-            if i is None:
-                raise KeyError(f"ROI not found in hemi union: {(atlas, roi, hemi)}")
-            return indices[indptr[i]:indptr[i+1]].astype(np.int32)
-
-    def get_roi_flat_indices(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
-        """Convenience: return original-space flat indices for an ROI via union mapping.
-
-        This composes get_union_index(hemi=hemi) and get_roi_positions(atlas, roi, hemi)
-        so callers can directly obtain the flat indices into the original vertex/voxel grid.
-        """
-        union_flat = self.get_union_index(hemi=hemi)
-        pos = self.get_roi_positions(atlas, roi, hemi)
-        return union_flat[pos]
+        return summary
