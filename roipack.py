@@ -4,12 +4,131 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
 import h5py
 import nibabel as nib
 import numpy as np
+
+#: Dataset creation kwargs, matching exactly what prfprepare writes for the
+#: roi_pack_tree_v2 schema. Keeping these identical means an added ROI is
+#: indistinguishable from an atlas ROI to any reader.
+_CREATE_KW = dict(compression="gzip", compression_opts=4, shuffle=True, fletcher32=True)
+
+
+@contextmanager
+def open_pack_for_write(h5_path, atomic: bool = True):
+    """Open an ROI pack read-write.
+
+    With ``atomic=True`` the edits go to a sibling temp copy that only replaces
+    the original once it closed cleanly, so an interrupted write can never leave
+    a half-written pack behind. The temp file has to be a sibling because
+    ``os.replace`` is only atomic within one filesystem.
+
+    Parameters
+    ----------
+    h5_path : Path | str
+        The pack to edit.
+    atomic : bool, optional
+        Copy-then-replace when True, edit in place when False.
+
+    Yields
+    ------
+    h5py.File
+        The writable file object.
+    """
+    h5_path = Path(h5_path)
+
+    def _open(p):
+        try:
+            return h5py.File(str(p), "r+")
+        except OSError as e:
+            raise OSError(
+                f"could not open {p} for writing: {e}\n"
+                "On network mounts (ceph/SMB) this is usually HDF5 file locking; "
+                "try running with HDF5_USE_FILE_LOCKING=FALSE"
+            ) from e
+
+    if not atomic:
+        f = _open(h5_path)
+        try:
+            yield f
+        finally:
+            f.close()
+        return
+
+    tmp = h5_path.with_name(h5_path.name + f".tmp{os.getpid()}")
+    shutil.copyfile(str(h5_path), str(tmp))
+    try:
+        # keep the permission bits, but not BSD flags or timestamps: copystat
+        # raises on SMB/ceph mounts and on tmpfs, and we replace the file anyway
+        shutil.copymode(str(h5_path), str(tmp))
+    except OSError:
+        pass
+    try:
+        f = _open(tmp)
+        try:
+            yield f
+        finally:
+            f.close()
+        os.replace(str(tmp), str(h5_path))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _put_int32(grp, name, data, attrs):
+    """(Re)create an int32 index dataset with the pack's standard filters.
+
+    HDF5 datasets here are fixed-size, so an existing one is deleted rather
+    than resized.
+    """
+    if name in grp:
+        del grp[name]
+    ds = grp.create_dataset(
+        name, data=np.ascontiguousarray(data, dtype=np.int32), **_CREATE_KW
+    )
+    for k, v in attrs.items():
+        ds.attrs[k] = v
+    return ds
+
+
+def rebuild_index_group(f):
+    """Rewrite ``/index`` from the current contents of ``/original_space``.
+
+    The four index datasets are not resizable, so the whole group is dropped
+    and recreated. Walking the groups in sorted order reproduces the ordering
+    prfprepare writes (atlas, then roi, then hemi, all alphabetical).
+
+    Returns
+    -------
+    int
+        Number of (atlas, roi, hemi) entries written.
+    """
+    atl, roi, hem, pth = [], [], [], []
+    if "original_space" in f:
+        for a in sorted(f["original_space"].keys()):
+            for r in sorted(f["original_space"][a].keys()):
+                for h in sorted(f["original_space"][a][r].keys()):
+                    atl.append(a)
+                    roi.append(r)
+                    hem.append(h)
+                    pth.append(f"/original_space/{a}/{r}/{h}")
+
+    if "index" in f:
+        del f["index"]
+    g = f.create_group("index")
+    dt = h5py.string_dtype(encoding="utf-8")
+    for name, vals in (("atlas", atl), ("hemi", hem), ("path", pth), ("roi", roi)):
+        g.create_dataset(name, data=np.array(vals, dtype=object), dtype=dt)
+    return len(pth)
 
 
 class RoiPack:
@@ -429,3 +548,257 @@ class RoiPack:
                 summary["atlases"][atlas][roi] = hemispheres
 
         return summary
+
+    # --------------------------------- Write API ------------------------------------
+
+    def list_roi_attrs(self, atlas: str, roi: str, hemi: str) -> dict:
+        """Get all attributes of an ROI's original_space dataset.
+
+        Used to read back provenance written by :meth:`write_surface_rois`.
+
+        Parameters
+        ----------
+        atlas, roi, hemi : str
+            The ROI to look up.
+
+        Returns
+        -------
+        dict
+            The dataset's HDF5 attributes.
+        """
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            p = f"original_space/{atlas}/{roi}/{hemi}"
+            if p not in gbase:
+                raise KeyError(f"ROI not found: {atlas}/{roi}/{hemi}")
+            return dict(gbase[p].attrs)
+
+    def hemi_vertex_count(self, hemi: str) -> Optional[int]:
+        """Vertex count of a full hemisphere mesh, or None if not recorded.
+
+        Prefers ``vertex_counts`` from the pack metadata (written by newer
+        prfprepare versions), else the ``full_shape`` attribute of any
+        original_space dataset for that hemisphere.
+
+        Parameters
+        ----------
+        hemi : str
+            Hemisphere ('l' or 'r').
+
+        Returns
+        -------
+        int | None
+            Number of vertices, or None when the pack records neither.
+        """
+        vc = self.meta.get("vertex_counts")
+        if isinstance(vc, dict):
+            for k in (hemi, hemi.lower(), hemi.upper()):
+                if k in vc:
+                    return int(vc[k])
+
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+            if "original_space" not in gbase:
+                return None
+            for a in gbase["original_space"]:
+                for r in gbase["original_space"][a]:
+                    grp = gbase["original_space"][a][r]
+                    if hemi in grp and "full_shape" in grp[hemi].attrs:
+                        return int(np.asarray(grp[hemi].attrs["full_shape"]).ravel()[0])
+        return None
+
+    def drop_atlas(self, atlas: str, rebuild_index: bool = True, atomic: bool = True):
+        """Delete an atlas from both index spaces and from the extras group.
+
+        Note that HDF5 does not reclaim the freed space, so this is meant for
+        the small added atlases (like hand-drawn ROIs), not for the big ones.
+
+        Parameters
+        ----------
+        atlas : str
+            Atlas to remove.
+        rebuild_index : bool, optional
+            Rewrite ``/index`` afterwards.
+        atomic : bool, optional
+            Use the copy-then-replace path.
+
+        Returns
+        -------
+        int
+            Number of ROI groups removed.
+        """
+        n = 0
+        with open_pack_for_write(self.h5_path, atomic=atomic) as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+            for space in ("original_space", "masked_space", "full_extent"):
+                p = f"{space}/{atlas}"
+                if space in gbase and atlas in gbase[space]:
+                    n += len(gbase[p].keys())
+                    del gbase[p]
+            if rebuild_index:
+                rebuild_index_group(f)
+        return n
+
+    def write_surface_rois(self, specs, rebuild_index: bool = True, atomic: bool = True):
+        """Write surface ROIs into the pack, as one atomic batch.
+
+        Every spec must satisfy the pack's core invariant,
+        ``original_indices == flat_index_<hemi>[masked_indices]`` with equal
+        length and both strictly increasing. It is re-checked here and raises,
+        because PRFclass' ``_maskROI_from_roipack`` indexes the two arrays
+        positionally and would silently mismatch parameters and vertices.
+
+        Writing the whole batch in one call matters: the atomic path copies the
+        file, so one call per ROI would copy it once per ROI.
+
+        Parameters
+        ----------
+        specs : list of dict
+            Each with keys ``atlas``, ``roi``, ``hemi``, ``original_indices``,
+            ``masked_indices``, ``n_vertices``, and optionally ``provenance``
+            (extra attrs for both datasets) and ``full_extent`` (the unclipped
+            vertex list, stored under ``/full_extent/<atlas>/<roi>/<hemi>``).
+        rebuild_index : bool, optional
+            Rewrite ``/index`` after the batch.
+        atomic : bool, optional
+            Use the copy-then-replace path.
+
+        Returns
+        -------
+        int
+            Number of ROIs written.
+        """
+        specs = list(specs)
+        if not specs:
+            return 0
+
+        with open_pack_for_write(self.h5_path, atomic=atomic) as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+
+            flats = {}
+            for s in specs:
+                h = s["hemi"]
+                if h not in flats:
+                    key = f"masked_space/flat_index_{h}"
+                    if key not in gbase:
+                        raise KeyError(f"masked space flat index missing for hemi {h}")
+                    flats[h] = gbase[key][()].astype(np.int64)
+
+            for s in specs:
+                atlas, roi, hemi = s["atlas"], s["roi"], s["hemi"]
+                o = np.asarray(s["original_indices"], dtype=np.int64)
+                m = np.asarray(s["masked_indices"], dtype=np.int64)
+                tag = f"{atlas}/{roi}/{hemi}"
+
+                if o.size == 0:
+                    raise ValueError(
+                        f"{tag}: refusing to write an empty ROI; an empty dataset "
+                        "would show up in list_rois() while masking nothing"
+                    )
+                if o.size != m.size:
+                    raise ValueError(
+                        f"{tag}: original ({o.size}) and masked ({m.size}) index "
+                        "counts differ; they have to be positionally aligned"
+                    )
+                if np.any(np.diff(o) <= 0) or np.any(np.diff(m) <= 0):
+                    raise ValueError(f"{tag}: indices have to be strictly increasing")
+                flat = flats[hemi]
+                if m.min() < 0 or m.max() >= flat.size:
+                    raise ValueError(
+                        f"{tag}: masked indices out of range for a masked space of "
+                        f"{flat.size} vertices"
+                    )
+                if not np.array_equal(flat[m], o):
+                    raise ValueError(
+                        f"{tag}: flat_index[masked] != original, the two index "
+                        "spaces are not aligned"
+                    )
+
+                prov = dict(s.get("provenance") or {})
+                shared = dict(atlas=atlas, roi=roi, hemi=hemi, dtype="int32")
+                _put_int32(
+                    gbase.require_group(f"original_space/{atlas}/{roi}"),
+                    hemi,
+                    o,
+                    {
+                        **shared,
+                        "kind": "index",
+                        "order": "C",
+                        "space_hint": "surface",
+                        "full_shape": np.array([int(s["n_vertices"])], np.int32),
+                        **prov,
+                    },
+                )
+                _put_int32(
+                    gbase.require_group(f"masked_space/{atlas}/{roi}"),
+                    hemi,
+                    m,
+                    {
+                        **shared,
+                        "kind": "masked_space_indices",
+                        "grid_order": "vertex",
+                        **prov,
+                    },
+                )
+
+                # The unclipped delineation, kept outside original_space on
+                # purpose so it never turns up in list_atlases()/list_rois()
+                # and cannot break the alignment invariant. Used for borders.
+                full = s.get("full_extent")
+                if full is not None:
+                    full = np.unique(np.asarray(full, dtype=np.int64))
+                    _put_int32(
+                        gbase.require_group(f"full_extent/{atlas}/{roi}"),
+                        hemi,
+                        full,
+                        {
+                            **shared,
+                            "kind": "full_extent_index",
+                            "order": "C",
+                            "space_hint": "surface",
+                            "full_shape": np.array([int(s["n_vertices"])], np.int32),
+                            **prov,
+                        },
+                    )
+
+            if rebuild_index:
+                rebuild_index_group(f)
+
+        return len(specs)
+
+    def get_full_extent_indices(self, atlas: str, roi: str, hemi: str) -> np.ndarray:
+        """Get the unclipped vertex indices of an ROI, if they were stored.
+
+        Added ROIs (hand-drawn ones) keep their full delineation here, since
+        ``original_space`` can only hold the part that survives the analysed
+        mask. Falls back to ``original_space`` when no full extent was stored.
+
+        Parameters
+        ----------
+        atlas, roi, hemi : str
+            The ROI to look up.
+
+        Returns
+        -------
+        np.ndarray
+            Vertex indices in the original surface space.
+        """
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+            p = f"full_extent/{atlas}/{roi}/{hemi}"
+            if p in gbase:
+                return gbase[p][()].astype(np.int32)
+        return self.get_original_space_indices(atlas, roi, hemi)
+
+    def has_full_extent(self, atlas: str, roi: str, hemi: str) -> bool:
+        """Check whether an unclipped extent is stored for this ROI."""
+        with h5py.File(str(self.h5_path), "r") as f:
+            base = self._resolve_base_group(f)
+            gbase = f if base in ("/", None) else f[base]
+            return f"full_extent/{atlas}/{roi}/{hemi}" in gbase
