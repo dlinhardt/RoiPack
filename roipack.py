@@ -354,6 +354,15 @@ class RoiPack:
 
             return gbase[f"masked_space/{flat_index_key}"][()].astype(np.int32)
 
+    @staticmethod
+    def _read_grid_shape(gbase) -> tuple[int, int, int] | None:
+        """Grid shape of a grid group: a dataset in roi_pack_tree_v2, an attribute before."""
+        if "grid_shape" in gbase:
+            return tuple(int(v) for v in np.asarray(gbase["grid_shape"][()]).ravel())
+        if "grid_shape" in gbase.attrs:
+            return tuple(int(v) for v in np.asarray(gbase.attrs["grid_shape"]).ravel())
+        return None
+
     def get_grid_shape(self) -> tuple[int, int, int]:
         """Get the 3D shape of the current volume grid.
 
@@ -376,6 +385,10 @@ class RoiPack:
         with h5py.File(str(self.h5_path), "r") as f:
             base = self._resolve_base_group(f)
             gbase = f if base in ("/", None) else f[base]
+
+            shape = self._read_grid_shape(gbase)
+            if shape is not None:
+                return shape
 
             # Try to find any dataset with full_shape attribute
             for space_type in ["original_space", "masked_space"]:
@@ -431,10 +444,9 @@ class RoiPack:
             base = self._resolve_base_group(f)
             gbase = f if base in ("/", None) else f[base]
 
-            try:
-                grid_shape = np.array(gbase.attrs["grid_shape"]).astype(float)
-            except KeyError:
-                raise KeyError("Grid shape attribute not found in HDF5 file")
+            grid_shape = self._read_grid_shape(gbase)
+            if grid_shape is None:
+                raise KeyError("Grid shape not found in HDF5 file")
 
         coordinates = np.vstack(np.unravel_index(flat_indices, grid_shape)).T
         return coordinates.astype(np.int32)
